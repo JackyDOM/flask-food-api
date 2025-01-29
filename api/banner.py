@@ -1,5 +1,6 @@
 from flask import jsonify
 
+
 banner = [
   {
     'id': 1,
