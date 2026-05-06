@@ -748,3 +748,23 @@ async def insert_disability(
 #     # raw is empty or None → use defaults
 #     logging.info("No score_question from frontend → using default array")
 #     return default_questions, json.dumps(default_questions)
+
+
+==============
+=====================
+
+    # dob_iso             = datetime.strptime(date_of_birth, "%Y-%m-%d").isoformat() + "Z"
+===========
+===================
+
+    # existing_record = await crud_main.get_by_family_name_and_given_name(
+    #     db,
+    #     normalized_family_name,
+    #     normalized_given_name
+    # )
+
+    # if existing_record:
+    # raise HTTPException(
+    #     status_code=status.HTTP_409_CONFLICT,
+    #     detail=f"ជនមានពិការភាព {disability_family_name} {disability_given_name} បានចុះឈ្មោះរួចហើយ"
+    # )
