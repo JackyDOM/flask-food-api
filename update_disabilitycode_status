@@ -1,0 +1,130 @@
+# from ...crud.crud_dmis_log import crud_dmis_logs
+# from ...schemas.dmis_log import DmisLogsCreateInternal, DmisLogsUpdateInternal
+
+# import json
+
+# @router.put("/status/{disability_code}")
+# async def update_main_status(
+#     disability_code: str,
+#     payload: MainStatusUpdate,
+#     keycloak_user: Annotated[UserInSignInKeyCloak, Depends(get_user_info)],
+#     db: Annotated[AsyncSession, Depends(async_get_db)],
+# ):
+
+#     db_user = await validate_user(keycloak_user.username, keycloak_user, db)
+#     user_id = db_user["id"]
+
+#     request_body = json.dumps(payload.model_dump(), default=str)
+
+#     # STEP 1: CREATE PENDING LOG
+#     log_record = await crud_dmis_logs.create_log(
+#         db=db,
+#         log_data=DmisLogsCreateInternal(
+#             endpoint=f"/status/{disability_code}",
+#             method="PUT",
+#             disability_code=disability_code,
+#             request_payload=request_body,
+#             status="PENDING",
+#             is_received=False,
+#             created_by=user_id,
+#             timestamp=datetime.utcnow(),
+#         ),
+#     )
+
+#     try:
+#         # STEP 2: PREPARE UPDATE FIELDS
+#         update_fields = payload.model_dump(exclude_unset=True)
+
+#         if "new_status" not in update_fields:
+#             raise HTTPException(
+#                 status_code=400,
+#                 detail="new_status is required",
+#             )
+
+#         new_status = update_fields.pop("new_status")
+#         update_fields["status"] = new_status
+
+
+#         # STEP 3: UPDATE MAIN TABLE
+#         updated_record = await crud_main.update_by_disability_code(
+#             db=db,
+#             disability_code=disability_code,
+#             update_fields=update_fields,
+#             updated_by=user_id,
+#         )
+
+#         if not updated_record:
+#             raise HTTPException(
+#                 status_code=404,
+#                 detail=f"រកមិនឃើញ disability_code '{disability_code}'",
+#             )
+        
+#         # =================================================
+#         # STEP 4: CALL SPR API HERE
+
+
+#         # =================================================
+
+
+#         # STEP 5: SUCCESS RESPONSE
+#         response_data = {
+#             "error": False,
+#             "message": "Record updated successfully",
+#             "data": {
+#                 "id": updated_record.id,
+#                 "disability_code": updated_record.disability_code,
+#                 "status": updated_record.status,
+#                 "family_name": updated_record.family_name,
+#                 "given_name": updated_record.given_name,
+#                 "family_name_en": updated_record.family_name_en,
+#                 "given_name_en": updated_record.given_name_en,
+#                 "phone_number": updated_record.phone_number,
+#                 "eq_card": updated_record.eq_card,
+#                 "gender": updated_record.gender,
+#                 "dob": updated_record.dob,
+#                 "year_start_disability": updated_record.year_start_disability,
+#                 "remarks": updated_record.remarks,
+#                 "gazetteer_code": updated_record.gazetteer_code,
+#                 "updated_by": updated_record.updated_by,
+#             },
+#         }
+
+#         # STEP 6: UPDATE SAME LOG -> SUCCESS
+#         await crud_dmis_logs.update_log(
+#             db=db,
+#             record_id=log_record.id,
+#             update_data=DmisLogsUpdateInternal(
+#                 response_payload=json.dumps(
+#                     response_data,
+#                     default=str,
+#                 ),
+#                 status="SUCCESS",
+#                 is_received=True,
+#                 updated_by=user_id,
+#             ),
+#         )
+
+#         await db.commit()
+#         return response_data
+
+#     except Exception as e:
+#         await crud_dmis_logs.create_log(
+#             db=db,
+#             log_data=DmisLogsCreateInternal(
+#                 endpoint=f"/status/{disability_code}",
+#                 method="PUT",
+#                 disability_code=disability_code,
+#                 request_payload=request_body,
+#                 status="FAILED",
+#                 error_message=str(e),
+#                 is_received=False,
+#                 created_by=user_id,
+#             ),
+#         )
+
+#         await db.commit()
+
+#         raise HTTPException(
+#             status_code=500,
+#             detail=str(e),
+#         )
