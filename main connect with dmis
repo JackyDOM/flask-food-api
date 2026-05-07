@@ -1,0 +1,2314 @@
+from typing import Annotated,List, Optional
+import os
+import logging
+import json
+from datetime import datetime, date
+from pathlib import Path
+from urllib.parse import quote
+import uuid
+from http import HTTPStatus
+from fastapi import (
+    APIRouter, 
+    Depends, 
+    HTTPException, 
+    status, 
+    Form, 
+    UploadFile
+)
+from sqlalchemy import select
+from sqlalchemy.exc import IntegrityError
+from sqlalchemy.ext.asyncio import AsyncSession
+from ...core.config import settings
+# Auth & DB
+from ...api.auth_keycloak import get_user_info
+from ...core.db.database import async_get_db
+from ...core.utils.user_validation import validate_user
+from ...core.utils.helpers import get_asset_url
+
+# CRUD
+from ...crud.crud_main import crud_main
+from ...crud.crud_question_answer import crud_question_answer
+from app.crud.crud_user_profile import crud_user_profile
+
+# Models
+from ...models.main import AccountStatus, Gender
+from ...models.disability_type import DisabilityType
+from ...models.user_profile import UserProfile
+
+# Schemas
+from ...schemas.main import (
+    MainCreate,
+    MainCreateInternal,
+    MainRead,
+    MainUpdate,
+    MainSearch,
+    MainStats,
+    MainUserIDSearch,
+    MainDisabilitySearch,
+    MainListResponse,
+    MainRecordResponse,
+    DisabilityRecordResponse,
+    UserDisabilityRequest,
+    DisabilityUpdateRequest,
+    DisabilityRecieve,
+    DisabilityUpdate,
+    DisabilityDetail,
+    DisabilityComplaint,
+    DisabilityFraud,
+    DisabilityWithoutVillage,
+    complaint,
+    Fraud,
+    village,
+    district,
+    commune,
+    province,
+    ListSurvey,
+    AddSurvey,
+    DeleteSurvey,
+    DisabilitySearchCode
+
+)
+from ...schemas.question_answer import QuestionAnswerCreateInternal
+from ...schemas.user_keycloak import UserInSignInKeyCloak
+
+# DMIS Services
+from ...core.services.dmis_service import (
+    get_disability_handler,
+    get_list_disabilities_commune,
+    update_disability_reject,
+    update_disability_recieve_card,
+    update_disability_photo,
+    get_detail_of_disability,
+    get_complaint_solution_disability,
+    add_fraud_disability,
+    get_disability_without_village,
+    get_complaint,
+    get_fraud,
+    get_all_village,
+    get_district_by_province,
+    get_all_commune_by_district,
+    get_all_village_by_commune,
+    get_list_surveys,
+    add_survey,
+    delete_survey,
+    get_disability_code
+)
+
+
+router = APIRouter(tags=["main"], prefix="/main")
+
+logger = logging.getLogger("disability_logger")
+logging.basicConfig(level=logging.INFO)
+
+@router.get(
+    "/get-asset-url",
+    status_code=status.HTTP_201_CREATED,
+    summary="Get asset URL",
+    description="Create a new main record for a person"
+)
+
+async def get_disability_type_images(
+    keycloak_user: Annotated[UserInSignInKeyCloak, Depends(get_user_info)],
+    db: Annotated[AsyncSession, Depends(async_get_db)]
+) -> List[dict]:
+    result = await db.execute(select(DisabilityType))
+    disabilities = result.scalars().all()
+
+    if not disabilities:
+        logger.warning("No disability types found in the database")
+        raise HTTPException(status_code=404, detail="No disability types found")
+
+    urls_with_names = []
+    for disability in disabilities:
+        if disability.image:
+            # URL encode filename (for Khmer characters)
+            encoded_filename = quote(disability.image)
+            file_path = f"public/{encoded_filename}" 
+            url = get_asset_url(file_path=file_path, token=keycloak_user.token)
+            urls_with_names.append({
+                "title": disability.title, 
+                "url": url
+            })
+            logger.info(f"Generated URL for disability '{disability.title}': {url}")
+        else:
+            logger.warning(f"Disability '{disability.title}' has no image")
+
+    logger.info(f"Total URLs generated: {len(urls_with_names)}")
+    return urls_with_names
+
+# async def get_asset_url_test(
+#     keycloak_user: Annotated[UserInSignInKeyCloak, Depends(get_user_info)],
+#     db: Annotated[AsyncSession, Depends(async_get_db)]
+# ) -> str:
+
+#     return get_asset_url(file_path="public/disability_type.jpg", token=keycloak_user.token)
+
+    
+@router.post(
+    "/",
+    status_code=status.HTTP_201_CREATED,
+    response_model=MainRead,
+    summary="Create a new main record",
+    description="Create a new main record for a person"
+)
+async def create_main_record(
+    main_data: MainCreate,
+    keycloak_user: Annotated[UserInSignInKeyCloak, Depends(get_user_info)],
+    db: Annotated[AsyncSession, Depends(async_get_db)]
+) -> MainRead:
+    """
+    Create a new main record.
+    
+    Args:
+        main_data: Main record creation data
+        keycloak_user: Authenticated user information
+        db: Database session
+        
+    Returns:
+        Created main record
+    """
+    
+    # Validate user
+    db_user = await validate_user(keycloak_user.username, keycloak_user, db)
+    user_id = db_user["id"]
+    
+    try:
+        # Convert to internal schema
+        main_create = MainCreateInternal(
+            **main_data.dict(),
+            created_by=str(user_id)
+        )
+        
+        # Create the main record in database
+        created_main = await crud_main.create(db=db, object=main_create)
+        await db.commit()  # <-- commit transaction to DB
+        await db.refresh(created_main)
+        
+        return MainRead(
+            id=created_main.id,
+            name=created_main.name,
+            phone_number=created_main.phone_number,
+            first_name=created_main.first_name,
+            last_name=created_main.last_name,
+            first_name_kh=created_main.first_name_kh,
+            last_name_kh=created_main.last_name_kh,
+            gender=created_main.gender,
+            dob=created_main.dob,
+            have_eq_card=created_main.have_eq_card,
+            eq_card=created_main.eq_card,
+            disability_date=created_main.disability_date,
+            gazetteer_code=created_main.gazetteer_code,
+            status=created_main.status,
+            notes=created_main.notes,
+            spid=created_main.spid,
+            latitude=created_main.latitude,
+            longitude=created_main.longitude,
+            remarks=created_main.remarks,
+            created_by=created_main.created_by,
+            updated_by=created_main.updated_by
+        )
+        
+    except IntegrityError:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=f"Main record with name '{main_data.name}' already exists"
+        )
+    except Exception as e:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to create main record: {str(e)}"
+        )
+    
+
+
+# Search-User-ID
+@router.get(
+    "/getdisabilities",
+    response_model=DisabilityRecordResponse,
+    summary="Get All Disabilities",
+    description="Retrieve all disabilities from DMIS API service"
+)
+async def get_disbility(
+    keycloak_user: Annotated[UserInSignInKeyCloak, Depends(get_user_info)] = None,
+    db: Annotated[AsyncSession, Depends(async_get_db)] = None
+) -> DisabilityRecordResponse:
+
+    if keycloak_user:
+        await validate_user(keycloak_user.username, keycloak_user, db)
+
+    try:
+        disability_data = await get_disability_handler()
+
+        return DisabilityRecordResponse(
+            error=disability_data.get("error", False),
+            message=disability_data.get("message", "Data retrieved successfully"),
+            data=disability_data.get("data")
+        )
+
+    except Exception as e:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Failed to retrieve disability data: {e}"
+        )
+
+
+## Fetching Main-Record
+@router.get(
+    "/",
+    response_model=MainListResponse,
+    summary="Get all main records",
+    description="Retrieve all active main records with optional filtering"
+)
+async def get_main_records(
+    keycloak_user: Annotated[UserInSignInKeyCloak, Depends(get_user_info)],
+    db: Annotated[AsyncSession, Depends(async_get_db)],
+    skip: int = 0,
+    limit: int = 100,
+    status_filter: AccountStatus | None = None,
+    gazetteer_code: str | None = None,
+):
+    """
+    Get all main records with optional filtering.
+    
+    Args:
+        keycloak_user: Authenticated user information
+        db: Database session
+        skip: Number of records to skip
+        limit: Maximum number of records to return
+        status_filter: Filter by account status
+        gazetteer_code: Filter by gazetteer code
+        
+    Returns:
+        List of main records
+    """
+    
+    # Validate user
+    await validate_user(keycloak_user.username, keycloak_user, db)
+    
+    try:
+        if status_filter:
+            records = await crud_main.get_by_status(db=db, status=status_filter, skip=skip, limit=limit)
+        elif gazetteer_code:
+            records = await crud_main.get_by_gazetteer_code(db=db, gazetteer_code=gazetteer_code, skip=skip, limit=limit)
+        else:
+            records = await crud_main.get_all_active(db=db, skip=skip, limit=limit)
+        
+        result = [
+            MainRead(
+                id=record.id,
+                name=record.name,
+                phone_number=record.phone_number,
+                first_name=record.first_name,
+                last_name=record.last_name,
+                first_name_kh=record.first_name_kh,
+                last_name_kh=record.last_name_kh,
+                gender=record.gender,
+                dob=record.dob,
+                have_eq_card=record.have_eq_card,
+                eq_card=record.eq_card,
+                disability_date=record.disability_date,
+                gazetteer_code=record.gazetteer_code,
+                status=record.status,
+                notes=record.notes,
+                spid=record.spid,
+                latitude=record.latitude,
+                longitude=record.longitude,
+                remarks=record.remarks,
+                created_by=record.created_by,
+                updated_by=record.updated_by,
+                score_question=record.score_question,
+                disability_code=record.disability_code,
+                family_name=record.family_name,
+                given_name=record.given_name,
+                family_name_en=record.family_name_en,
+                given_name_en=record.given_name_en,
+
+                # disability_photo=record.disability_photo_path,
+                # disability_photo_infor=record.disability_photo_infor,
+                # disability_photo_doc=record.disability_photo_doc,
+
+                disability_getinfor=record.disability_getinfor,
+                disability_name=record.disability_name,
+                idpoor_status=record.idpoor_status,
+                vacine_status=record.vacine_status,
+                vacine_date=record.vacine_date,
+                live_with_who=record.live_with_who,
+                reason_disability=record.reason_disability,
+                year_start_disability=record.year_start_disability,
+                submit_date=record.submit_date,
+                child_education_level=record.child_education_level,
+                is_educated=record.is_educated,
+                education_level=record.education_level,
+                have_income=record.have_income,
+                primary_job=record.primary_job,
+                find_job=record.find_job,
+                no_job_reason=record.no_job_reason,
+                no_job_reason_other=record.no_job_reason_other,
+                no_tvet=record.no_tvet_reason,
+                is_tvet=record.is_tvet,
+                daily_help=record.daily_help,
+                chronic_diseases=record.chronic_diseases,
+                score_status_live=record.score_status_live,
+                
+            )
+            for record in records
+        ]
+    
+        return {
+            "error": False,
+            "message": "Successful fetching main records",
+            "data": result
+        }
+        
+    except Exception as e:
+        return {
+            "error": True,
+            "message": f"Failed to fetch main records: {str(e)}",
+            "data": []
+        }
+
+
+## Fetching Detail Main-Record
+@router.get(
+    "/{main_record_id}",
+    response_model=MainRecordResponse,
+    summary="Get main record by ID",
+)
+async def get_main_record(
+    main_record_id: int,
+    keycloak_user: Annotated[UserInSignInKeyCloak, Depends(get_user_info)],
+    db: Annotated[AsyncSession, Depends(async_get_db)],
+):
+    await validate_user(keycloak_user.username, keycloak_user, db)
+
+    try:
+        record = await crud_main.get(db=db, id=main_record_id)
+
+        if not record or record.get("is_deleted"):
+            return MainListResponse(
+                error=True,
+                message="Fail for fetching detail main record",
+                data=[]
+            )
+
+        main_read = MainRead(**record)
+
+        return MainRecordResponse(
+            error=False,
+            message="Successful for fetching detail main record",
+            data=[main_read] 
+        )
+
+    except Exception as e:
+        return MainRecordResponse(
+            error=True,
+            message=f"Fail for fetching detail main record: {str(e)}",
+            data=[]
+        )
+    
+
+@router.post(
+    "/searchdisability",
+    response_model=list[MainRead],
+    summary="Search main records",
+    description="Search main records with multiple criteria"
+)
+async def search_main_records(
+    search_params: MainDisabilitySearch,
+    keycloak_user: Annotated[UserInSignInKeyCloak, Depends(get_user_info)],
+    db: Annotated[AsyncSession, Depends(async_get_db)],
+    skip: int = 0,
+    limit: int = 100,
+) -> list[MainRead]:
+    """
+    Search main records with multiple criteria.
+    
+    Args:
+        search_params: Search parameters
+        keycloak_user: Authenticated user information
+        db: Database session
+        skip: Number of records to skip
+        limit: Maximum number of records to return
+        
+    Returns:
+        List of matching main records
+    """
+    
+    # Validate user
+    await validate_user(keycloak_user.username, keycloak_user, db)
+    
+    try:
+        records = await crud_main.search_Disability_records(db=db, search_params=search_params, skip=skip, limit=limit)
+        
+        return [
+            MainRead(
+                id=record.id,
+                name=record.name,
+                phone_number=record.phone_number,
+                first_name=record.first_name,
+                last_name=record.last_name,
+                first_name_kh=record.first_name_kh,
+                last_name_kh=record.last_name_kh,
+                gender=record.gender,
+                dob=record.dob,
+                have_eq_card=record.have_eq_card,
+                eq_card=record.eq_card,
+                disability_date=record.disability_date,
+                gazetteer_code=record.gazetteer_code,
+                status=record.status,
+                notes=record.notes,
+                spid=record.spid,
+                latitude=record.latitude,
+                longitude=record.longitude,
+                remarks=record.remarks,
+                created_by=record.created_by,
+                updated_by=record.updated_by,
+                family_name=record.family_name,
+                given_name=record.given_name,
+                family_name_en=record.family_name_en,
+                given_name_en=record.given_name_en,
+                disability_code=record.disability_code,
+                disability_getinfor=record.disability_getinfor,
+                disability_name=record.disability_name,
+                idpoor_status=record.idpoor_status,
+                vacine_status=record.vacine_status,
+                vacine_date=record.vacine_date,
+                live_with_who=record.live_with_who,
+                reason_disability=record.reason_disability,
+                year_start_disability=record.year_start_disability,
+                submit_date=record.submit_date,
+                child_education_level=record.child_education_level,
+                is_educated=record.is_educated,
+                education_level=record.education_level,
+                have_income=record.have_income,
+                primary_job=record.primary_job,
+                find_job=record.find_job,
+                no_job_reason=record.no_job_reason,
+                no_job_reason_other=record.no_job_reason_other,
+                no_tvet=record.no_tvet_reason,
+                is_tvet=record.is_tvet,
+                daily_help=record.daily_help,
+                chronic_diseases=record.chronic_diseases,
+                score_status_live=record.score_status_live,
+                score_question=record.score_question,
+
+                # disability_photo=record.disability_photo_path,
+                # disability_photo_infor=record.disability_photo_infor,
+                # disability_photo_doc=record.disability_photo_doc,
+            )
+            for record in records
+        ]
+        
+    except Exception as e:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to search main records: {str(e)}"
+        )
+
+
+@router.post(
+    "/getdisabilities",
+    summary="Get Disabilities by User ID",
+    description="Search User ID in user_profile and return disabilities from DMIS API"
+)
+async def get_disabilities_by_user(
+    request: UserDisabilityRequest,
+    keycloak_user: Annotated[dict, Depends(get_user_info)],
+    db: Annotated[AsyncSession, Depends(async_get_db)],
+):
+    
+    await validate_user(keycloak_user.username, keycloak_user, db)
+
+    try:
+        user_id_pwd_str = str(request.user_id_pwd)
+
+        stmt = select(UserProfile).where(UserProfile.user_id_pwd == user_id_pwd_str)
+        result = await db.execute(stmt)
+        user = result.scalar_one_or_none()
+
+        if not user:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail=f"User with user_id_pwd {user_id_pwd_str} not found"
+            )
+
+        # 2. Call DMIS API to get user's profile/disabilities
+        dmis_response = await get_list_disabilities_commune({"user_id_pwd": user.user_id_pwd})
+
+
+        if dmis_response.get("error"):
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=f"Failed to get disabilities from DMIS API for user {user.user_id_pwd}"
+            )
+            
+
+        # 3. Return formatted response
+        return {
+            "error": False,
+            "message": "List of beneficiary members",
+            "disabilities": dmis_response.get("data") 
+        }
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"An unexpected error occurred: {str(e)}"
+        )
+
+
+@router.post(
+    "/getdisabilitiesupdate",
+    summary="Get Disabilities Update (Reinterview endpoint)",
+    description=""
+)
+async def get_disabilities_update(
+    request: UserDisabilityRequest,
+    keycloak_user: Annotated[dict, Depends(get_user_info)],
+    db: Annotated[AsyncSession, Depends(async_get_db)],
+):
+    await validate_user(keycloak_user.username, keycloak_user, db)
+
+    try:
+        user_id_pwd = str(request.user_id_pwd)
+
+        stmt = select(UserProfile).where(UserProfile.user_id_pwd == user_id_pwd)
+        result = await db.execute(stmt)
+        user = result.scalar_one_or_none()
+
+        if not user:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail=f"User with user_id_pwd {user_id_pwd} not found"
+            )
+        
+        dmis_response = await get_list_disabilities_commune({"user_id_pwd": user.user_id_pwd})
+
+        if dmis_response.get("error"):
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=f"Failed to get disabilities from DMIS API for user {user.user_id_pwd}"
+            )
+        
+        return {
+            "error": False,
+            "message": "List of beneficiary memebers",
+            "disabilities": dmis_response.get("data")
+        }
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"An unexpected error occurred: {str(e)}"
+        )  
+
+
+@router.post(
+    "/getdisabilitiesupdatenew",
+    summary="Get Disabilities For Update",
+    description=""
+)
+async def get_disabilities_update_new(
+    request: UserDisabilityRequest,
+    keycloak_user: Annotated[dict, Depends(get_user_info)],
+    db: Annotated[AsyncSession, Depends(async_get_db)],
+):
+    
+    await validate_user(keycloak_user.username, keycloak_user, db)
+
+    try:
+        user_id_pwd = str(request.user_id_pwd)
+
+        stmt = select(UserProfile).where(UserProfile.user_id_pwd == user_id_pwd)
+        result = await db.execute(stmt)
+        user = result.scalar_one_or_none()
+
+        if not user:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail=f"User with user_id_pwd {user_id_pwd} not found"
+            )
+        
+        dmis_response = await get_list_disabilities_commune({"user_id_pwd": user.user_id_pwd})
+
+        if dmis_response.get("error"):
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=f"Failed to get disability from DMIN API for user {user.user_id_pwd}"
+            )
+        
+        return {
+            "error": False,
+            "message": "List of beneficiary members",
+            "disabilities": dmis_response.get("data")
+        }
+    
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"An unexpected error occurred: {str(e)}"
+        )
+
+
+## Update Disabilities Rejected (Remove data)
+@router.post(
+    "/updatedisabilityreject",
+    summary="Update Disabilities Rejected (Remove data)",
+    description="Remove a disability record from DMIS and update reject info"
+)
+async def get_disability_rejected(
+    request: DisabilityUpdateRequest,
+    keycloak_user: Annotated[dict, Depends(get_user_info)],
+    db: Annotated[AsyncSession, Depends(async_get_db)],
+):
+    await validate_user(keycloak_user.username, keycloak_user, db)
+
+    try:
+        remove_params = {
+            "id": int(request.disability_id),
+            "updated_by": str(request.updated_by)
+        }
+
+        dmis_result = await update_disability_reject(remove_params)
+
+        return {
+            "error": dmis_result["error"],
+            "message": dmis_result["message"]
+        }
+
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"An unexpected error occurred: {str(e)}"
+        )
+
+
+## Update Disabilities Received Card (Scan delivery card to disability person)
+@router.post("/disabilityrecivecard")
+async def update_disability_recieve_card_route(
+    request: DisabilityRecieve,
+    keycloak_user: Annotated[dict, Depends(get_user_info)],
+    db: Annotated[AsyncSession, Depends(async_get_db)],
+):
+
+    await validate_user(keycloak_user.username, keycloak_user, db)
+
+    try:
+        recieve_params = {
+            "id": request.id,
+            "created_by": request.created_by,
+            "st_qr": request.st_qr
+        }
+
+        dmis_result = await update_disability_recieve_card(recieve_params)
+
+        if dmis_result.get("error") and "not found" in dmis_result.get("message", "").lower():
+            return {
+                "error": True,
+                "message": "Data not found"
+            }
+
+        return {
+            "error": dmis_result.get("error", False),
+            "message": dmis_result.get(
+                "message",
+                "ការផ្ទៀងផ្ទាត់បានជោគជ័យ សូមផ្តល់កាតជូនជនមានពិការភាព"
+            )
+        }
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(
+            status_code=500,
+            detail=f"An unexpected error occurred: {str(e)}"
+        )
+
+
+## Update Disability
+@router.post("/updatedisability")
+async def update_disability_route(
+    request: DisabilityUpdate,
+    keycloak_user: Annotated[dict, Depends(get_user_info)],
+    db: Annotated[AsyncSession, Depends(async_get_db)],
+):
+
+    await validate_user(keycloak_user.username, keycloak_user, db)
+
+    try:
+        """
+        
+        """
+
+        disability_params = {
+            "id": request.id,
+            "family_code": request.family_code,    
+            "updated_by": request.updated_by,        
+            "fileColumnKeys": request.fileColumnKeys 
+        }
+
+        dmis_result = await update_disability_photo(disability_params)
+
+        if dmis_result.get("error"):
+            return {
+                "error": True,
+                "message": dmis_result.get("message", "មិនអាចកែទិន្នន័យនេះបានទេ")
+            }
+
+        return {
+            "error": False,
+            "message": dmis_result.get("message", "save disability completed")
+        }
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"An unexpected error occurred: {str(e)}"
+        )
+
+
+
+## Detail of Disability
+@router.post("/getdisabilitydetailbyID")
+async def get_disability_detail_route(
+    request: DisabilityDetail,
+    keycloak_user: Annotated[dict, Depends(get_user_info)],
+    db: Annotated[AsyncSession, Depends(async_get_db)],
+):
+    await validate_user(keycloak_user.username, keycloak_user, db)
+
+    try:
+        detail_param = {"id": request.id}
+
+        dmis_result = await get_detail_of_disability(detail_param)
+
+        if dmis_result.get("error"):
+            return {
+                "error": True,
+                "message": dmis_result.get("message", "DATA NOT FOUND")
+            }
+
+        return dmis_result
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"An unexpected error occurred: {str(e)}"
+        )
+
+
+# Add Complaint Solution
+@router.post("/addcomplaint_solution")
+async def complaint_solution_route(
+    request: DisabilityComplaint,
+    keycloak_user: Annotated[dict, Depends(get_user_info)],
+    db: Annotated[AsyncSession, Depends(async_get_db)],
+):
+    await validate_user(keycloak_user.username, keycloak_user, db)
+
+    try:
+        complaint_param = {
+            "user_id": request.user_id,
+            "disability_id": request.disability_id,
+            "is_disability": request.is_disability,
+            "person_complaint_name": request.person_complaint_name,
+            "relationship": request.relationship,
+            "person_receive": request.person_receive,
+            "complaint_result": request.complaint_result,
+            "complaint_type": request.complaint_type,
+            "title": request.title,
+            "request_update": request.request_update,
+            "status": request.status
+        }
+
+        dmis_result = await get_complaint_solution_disability(complaint_param)
+
+
+        if dmis_result.get("error"):
+            return {
+                "error": True,
+                "message": dmis_result.get("message", "DATA NOT FOUND")
+            }
+
+        return dmis_result
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"An unexpected error occurred: {str(e)}"
+        )
+    
+
+# Add Fraud Disability
+@router.post("/addfraud_solution")
+async def fraud_solution_route(
+    request: DisabilityFraud,
+    keycloak_user: Annotated[dict, Depends(get_user_info)],
+    db: Annotated[AsyncSession, Depends(async_get_db)],
+):
+    await validate_user(keycloak_user.username, keycloak_user, db)
+
+    try:
+        fraud_param = {
+            "user_id": request.user_id,
+            "disability_id": request.disability_id,
+            "reporter_name": request.reporter_name,
+            "reporter_title": request.reporter_title,
+            "reporter_address": request.reporter_address,
+            "fraud_type": request.fraud_type
+        }
+
+        dmis_result = await add_fraud_disability(fraud_param)
+
+        if dmis_result.get("error"):
+            return {
+                "error": True,
+                "message": dmis_result.get("message", "DATA NOT FOUND")
+            }
+        
+        return dmis_result
+    
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"An unexpected error occurred: {str(e)}"
+        )
+
+
+# Get disability without village
+@router.post("/getDisabilitiesWithoutVillage")
+async def get_disability_without_village_route(
+    request: DisabilityWithoutVillage,
+    keycloak_user: Annotated[dict, Depends(get_user_info)],
+    db: Annotated[AsyncSession, Depends(async_get_db)],
+):
+    await validate_user(keycloak_user.username, keycloak_user, db)
+
+    try:
+        village_param = {
+            "user_id": request.user_id
+        }
+
+        dmis_result = await get_disability_without_village(village_param)
+
+        if dmis_result.get("error"):
+            return {
+                "error": True,
+                "message": dmis_result.get("message", "DATA NOT FOUND")
+            }
+        
+        return dmis_result
+    
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"An unexpected error occurred: {str(e)}"
+        )
+
+
+# Get complaint
+@router.post("/getcomplaint_solution")
+async def get_complaint_route(
+    request: complaint,
+    keycloak_user: Annotated[dict, Depends(get_user_info)],
+    db: Annotated[AsyncSession, Depends(async_get_db)],
+):
+    await validate_user(keycloak_user.username, keycloak_user, db)
+
+    try:
+        complaint_param = {
+            "user_id": request.user_id
+        }
+
+        dmis_result = await get_complaint(complaint_param)
+
+        if dmis_result.get("error"):
+            return {
+                "error": True,
+                "message": dmis_result.get("message", "DATA NOT FOUND")
+            }
+        
+        return dmis_result
+    
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"An unexpected error occurred: {str(e)}"
+        )
+    
+# Get Fraud
+@router.post("/getfraud_solution")
+async def get_fraud_route(
+    request: Fraud,
+    keycloak_user: Annotated[dict, Depends(get_user_info)],
+    db: Annotated[AsyncSession, Depends(async_get_db)],
+):
+    await validate_user(keycloak_user.username, keycloak_user, db)
+
+    try:
+        fraud_param = {
+            "user_id": request.user_id
+        }
+
+        dmis_result = await get_fraud(fraud_param)
+
+        if dmis_result.get("error"):
+            return {
+                "error": True,
+                "message": dmis_result.get("message", "DATA NOT FOUND")
+            }
+        
+        return dmis_result
+    
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"An unexpected error occurred: {str(e)}"
+        )
+
+
+# Get All Provinces
+@router.post("/getProvinces")
+async def get_all_province_route(
+    request: village,
+    keycloak_user: Annotated[dict, Depends(get_user_info)],
+    db: Annotated[AsyncSession, Depends(async_get_db)],
+):
+    await validate_user(keycloak_user.username, keycloak_user, db)
+
+    try:
+        village_param = {
+            "user_id": request.user_id
+        }
+
+        dmis_result = await get_all_village(village_param)
+
+        if dmis_result.get("error"):
+            return {
+                "error": True,
+                "message": dmis_result.get("message", "DATA NOT FOUND")
+            }
+        
+        return dmis_result
+    
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"An unexpected error occurred: {str(e)}"
+        )
+
+
+# Get District By Provinces
+@router.post("/getDistricts")
+async def get_fraud_route(
+    request: district,
+    keycloak_user: Annotated[dict, Depends(get_user_info)],
+    db: Annotated[AsyncSession, Depends(async_get_db)],
+):
+    await validate_user(keycloak_user.username, keycloak_user, db)
+
+    try:
+        district_param = {
+            "province": request.province
+        }
+
+        dmis_result = await get_district_by_province(district_param)
+
+        if dmis_result.get("error"):
+            return {
+                "error": True,
+                "message": dmis_result.get("message", "DATA NOT FOUND")
+            }
+        
+        return dmis_result
+    
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"An unexpected error occurred: {str(e)}"
+        )
+
+
+# Get Commune By District
+@router.post("/getCommunes")
+async def get_commune_route(
+    request: commune,
+    keycloak_user: Annotated[dict, Depends(get_user_info)],
+    db: Annotated[AsyncSession, Depends(async_get_db)],
+):
+    await validate_user(keycloak_user.username, keycloak_user, db)
+
+    try:
+        fraud_param = {
+            "district": request.district
+        }
+
+        dmis_result = await get_all_commune_by_district(fraud_param)
+
+        if dmis_result.get("error"):
+            return {
+                "error": True,
+                "message": dmis_result.get("message", "DATA NOT FOUND")
+            }
+        
+        return dmis_result
+    
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"An unexpected error occurred: {str(e)}"
+        )
+
+# Get Province by commune
+@router.post("/getVillages")
+async def get_commune_route(
+    request: province,
+    keycloak_user: Annotated[dict, Depends(get_user_info)],
+    db: Annotated[AsyncSession, Depends(async_get_db)],
+):
+    await validate_user(keycloak_user.username, keycloak_user, db)
+
+    try:
+        province_param = {
+            "commune": request.commune
+        }
+
+        dmis_result = await get_all_village_by_commune(province_param)
+
+        if dmis_result.get("error"):
+            return {
+                "error": True,
+                "message": dmis_result.get("message", "DATA NOT FOUND")
+            }
+        
+        return dmis_result
+    
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"An unexpected error occurred: {str(e)}"
+        )
+
+
+# Get List Survey
+@router.get("/surveys/index")
+async def get_survey_route(
+    request: ListSurvey,
+    keycloak_user: Annotated[dict, Depends(get_user_info)],
+    db: Annotated[AsyncSession, Depends(async_get_db)],
+):
+    await validate_user(keycloak_user.username, keycloak_user, db)
+
+    try:
+        dmis_result = await get_list_surveys({"user_id": request.user_id})
+
+        if dmis_result.get("error"):
+            return {
+                "error": True,
+                "message": dmis_result.get("message", "DATA NOT FOUND")
+            }
+
+        return dmis_result
+
+    except Exception as e:
+        raise HTTPException(
+            status_code=500,
+            detail=f"An unexpected error occurred: {str(e)}"
+        )
+    
+
+# Add Survey
+@router.post("/surveys/add")
+async def get_commune_route(
+    request: AddSurvey,
+    keycloak_user: Annotated[dict, Depends(get_user_info)],
+    db: Annotated[AsyncSession, Depends(async_get_db)],
+):
+    await validate_user(keycloak_user.username, keycloak_user, db)
+
+    try:
+        add_survey_param = {
+            "disability_code": request.disability_code,
+            "disability_name": request.disability_name,
+            "disability_gender": request.disability_gender,
+            "is_disability_interview": request.is_disability_interview,
+            "is_id_poor": request.is_id_poor,
+            "is_update_id_poor": request.is_update_id_poor,
+            "is_family_package": request.is_family_package,
+            "is_tvet": request.is_tvet,
+            "created_by": request.created_by,
+            "province_id": request.province_id,
+            "district_id": request.district_id,
+            "commune_id": request.commune_id,
+            "village_id": request.village_id,
+        }
+
+        dmis_result = await add_survey(add_survey_param)
+
+        if dmis_result.get("error"):
+            return {
+                "error": True,
+                "message": dmis_result.get("message", "DATA NOT FOUND")
+            }
+        
+        return dmis_result
+    
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"An unexpected error occurred: {str(e)}"
+        )
+
+
+
+# Delete Survey
+@router.post("/surveys/delete")
+async def delete_survey_route(
+    request: DeleteSurvey,
+    keycloak_user: Annotated[dict, Depends(get_user_info)],
+    db: Annotated[AsyncSession, Depends(async_get_db)],
+):
+    await validate_user(keycloak_user.username, keycloak_user, db)
+
+    try:
+        delete_survey_param = {
+            "id": request.id,
+            
+        }
+
+        dmis_result = await delete_survey(delete_survey_param)
+
+        if dmis_result.get("error"):
+            return {
+                "error": True,
+                "message": dmis_result.get("message", "DATA NOT FOUND")
+            }
+        
+        return dmis_result
+    
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"An unexpected error occurred: {str(e)}"
+        )
+
+
+
+# Search-Disability-code from DMIS API
+@router.post("/searchdisabilitycode")
+async def search_disability_code(
+    request: DisabilitySearchCode,
+    keycloak_user: Annotated[dict, Depends(get_user_info)],
+    db: Annotated[AsyncSession, Depends(async_get_db)],
+):
+    await validate_user(keycloak_user.username, keycloak_user, db)
+
+    try:
+        search_disability_code = {
+            "disability_code": request.disability_code,
+        }
+
+        dmis_result = await get_disability_code(search_disability_code)
+
+        if dmis_result.get("error"):
+            return {
+                "error": True,
+                "message": dmis_result.get("message", "DATA NOT FOUND")
+            }
+        
+        return dmis_result
+    
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"An unexpected error occurred: {str(e)}"
+        )
+
+
+
+@router.get(
+    "/stats",
+    response_model=MainStats,
+    summary="Get main records statistics",
+    description="Get comprehensive statistics about main records"
+)
+async def get_main_statistics(
+    keycloak_user: Annotated[UserInSignInKeyCloak, Depends(get_user_info)],
+    db: Annotated[AsyncSession, Depends(async_get_db)]
+) -> MainStats:
+    """
+    Get comprehensive statistics about main records.
+    
+    Args:
+        keycloak_user: Authenticated user information
+        db: Database session
+        
+    Returns:
+        Statistics about main records
+    """
+    
+    # Validate user
+    await validate_user(keycloak_user.username, keycloak_user, db)
+    
+    try:
+        return await crud_main.get_statistics(db=db)
+        
+    except Exception as e:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to retrieve statistics: {str(e)}"
+        )
+
+
+@router.get(
+    "/{main_id}",
+    response_model=MainRead,
+    summary="Get main record by ID",
+    description="Retrieve a specific main record by its ID"
+)
+async def get_main_record(
+    main_id: int,
+    keycloak_user: Annotated[UserInSignInKeyCloak, Depends(get_user_info)],
+    db: Annotated[AsyncSession, Depends(async_get_db)]
+) -> MainRead:
+    """
+    Get a specific main record by ID.
+    
+    Args:
+        main_id: ID of the main record to retrieve
+        keycloak_user: Authenticated user information
+        db: Database session
+        
+    Returns:
+        Main record details
+    """
+    
+    # Validate user
+    await validate_user(keycloak_user.username, keycloak_user, db)
+    
+    try:
+        record = await crud_main.get(db=db, id=main_id)
+        if not record or record.is_deleted:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="Main record not found"
+            )
+        
+        return MainRead(
+            id=record.id,
+            name=record.name,
+            phone_number=record.phone_number,
+            first_name=record.first_name,
+            last_name=record.last_name,
+            first_name_kh=record.first_name_kh,
+            last_name_kh=record.last_name_kh,
+            gender=record.gender,
+            dob=record.dob,
+            have_eq_card=record.have_eq_card,
+            eq_card=record.eq_card,
+            disability_date=record.disability_date,
+            gazetteer_code=record.gazetteer_code,
+            status=record.status,
+            notes=record.notes,
+            spid=record.spid,
+            latitude=record.latitude,
+            longitude=record.longitude,
+            remarks=record.remarks,
+            created_by=record.created_by,
+            updated_by=record.updated_by
+        )
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to retrieve main record: {str(e)}"
+        )
+
+
+@router.put(
+    "/{main_id}",
+    response_model=MainRead,
+    summary="Update main record",
+    description="Update an existing main record"
+)
+async def update_main_record(
+    main_id: int,
+    main_update: MainUpdate,
+    keycloak_user: Annotated[UserInSignInKeyCloak, Depends(get_user_info)],
+    db: Annotated[AsyncSession, Depends(async_get_db)]
+) -> MainRead:
+    """
+    Update an existing main record.
+    
+    Args:
+        main_id: ID of the main record to update
+        main_update: Update data
+        keycloak_user: Authenticated user information
+        db: Database session
+        
+    Returns:
+        Updated main record
+    """
+    
+    # Validate user
+    db_user = await validate_user(keycloak_user.username, keycloak_user, db)
+    user_id = db_user["id"]
+    
+    try:
+        # Check if record exists
+        existing_record = await crud_main.get(db=db, id=main_id)
+        if not existing_record or existing_record.is_deleted:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="Main record not found"
+            )
+        
+        # Prepare update data
+        from ...schemas.main import MainUpdateInternal
+        update_data = MainUpdateInternal(
+            **main_update.dict(exclude_unset=True),
+            updated_by=user_id
+        )
+        
+        # Update the record
+        updated_record = await crud_main.update(db=db, id=main_id, object=update_data)
+        
+        return MainRead(
+            id=updated_record.id,
+            name=updated_record.name,
+            phone_number=updated_record.phone_number,
+            first_name=updated_record.first_name,
+            last_name=updated_record.last_name,
+            first_name_kh=updated_record.first_name_kh,
+            last_name_kh=updated_record.last_name_kh,
+            gender=updated_record.gender,
+            dob=updated_record.dob,
+            have_eq_card=updated_record.have_eq_card,
+            eq_card=updated_record.eq_card,
+            disability_date=updated_record.disability_date,
+            gazetteer_code=updated_record.gazetteer_code,
+            status=updated_record.status,
+            notes=updated_record.notes,
+            spid=updated_record.spid,
+            latitude=updated_record.latitude,
+            longitude=updated_record.longitude,
+            remarks=updated_record.remarks,
+            created_by=updated_record.created_by,
+            updated_by=updated_record.updated_by
+        )
+        
+    except HTTPException:
+        raise
+    except IntegrityError:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="Duplicate name or unique constraint violation"
+        )
+    except Exception as e:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to update main record: {str(e)}"
+        )
+
+
+@router.put(
+    "/{main_id}/status",
+    response_model=MainRead,
+    summary="Update main record status",
+    description="Update only the status of a main record"
+)
+async def update_main_status(
+    main_id: int,
+    new_status: AccountStatus,
+    keycloak_user: Annotated[UserInSignInKeyCloak, Depends(get_user_info)],
+    db: Annotated[AsyncSession, Depends(async_get_db)]
+) -> MainRead:
+    """
+    Update only the status of a main record.
+    
+    Args:
+        main_id: ID of the main record to update
+        new_status: New status to set
+        keycloak_user: Authenticated user information
+        db: Database session
+        
+    Returns:
+        Updated main record
+    """
+    
+    # Validate user
+    db_user = await validate_user(keycloak_user.username, keycloak_user, db)
+    user_id = db_user["id"]
+    
+    try:
+        # Update status
+        updated_record = await crud_main.update_status(
+            db=db, 
+            record_id=main_id, 
+            new_status=new_status, 
+            updated_by=user_id
+        )
+        
+        if not updated_record:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="Main record not found"
+            )
+        
+        return MainRead(
+            id=updated_record.id,
+            name=updated_record.name,
+            phone_number=updated_record.phone_number,
+            first_name=updated_record.first_name,
+            last_name=updated_record.last_name,
+            first_name_kh=updated_record.first_name_kh,
+            last_name_kh=updated_record.last_name_kh,
+            gender=updated_record.gender,
+            dob=updated_record.dob,
+            have_eq_card=updated_record.have_eq_card,
+            eq_card=updated_record.eq_card,
+            disability_date=updated_record.disability_date,
+            gazetteer_code=updated_record.gazetteer_code,
+            status=updated_record.status,
+            notes=updated_record.notes,
+            spid=updated_record.spid,
+            latitude=updated_record.latitude,
+            longitude=updated_record.longitude,
+            remarks=updated_record.remarks,
+            created_by=updated_record.created_by,
+            updated_by=updated_record.updated_by
+        )
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to update main record status: {str(e)}"
+        )
+
+
+@router.delete(
+    "/{main_id}",
+    summary="Delete main record",
+    description="Soft delete a main record (mark as deleted)"
+)
+async def delete_main_record(
+    main_id: int,
+    keycloak_user: Annotated[UserInSignInKeyCloak, Depends(get_user_info)],
+    db: Annotated[AsyncSession, Depends(async_get_db)]
+) -> dict:
+    """
+    Soft delete a main record.
+    
+    Args:
+        main_id: ID of the main record to delete
+        keycloak_user: Authenticated user information
+        db: Database session
+        
+    Returns:
+        Deletion confirmation
+    """
+    
+    # Validate user
+    db_user = await validate_user(keycloak_user.username, keycloak_user, db)
+    
+    try:
+        # Check if record exists
+        existing_record = await crud_main.get(db=db, id=main_id)
+        if not existing_record or existing_record.is_deleted:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="Main record not found"
+            )
+        
+        # Soft delete the record
+        await crud_main.db_delete(db=db, id=main_id)
+        
+        return {
+            "message": f"Main record '{existing_record.name}' has been deleted successfully",
+            "deleted_id": main_id
+        }
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to delete main record: {str(e)}"
+        )
+
+
+# Directory to save uploaded files
+UPLOAD_DIR = Path("app/api/v1/uploads")
+UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
+
+ALLOWED_EXTENSIONS = {'.jpg', '.jpeg', '.png', '.pdf', '.webp'}
+MAX_FILE_SIZE = 10 * 1024 * 1024  # 10MB
+import uuid
+import mimetypes
+
+async def save_upload_file(file: UploadFile, folder: Path) -> str:
+    if file is None:
+        return None
+    
+    # Validate file size
+    content = await file.read()
+    if len(content) > MAX_FILE_SIZE:
+        raise HTTPException(
+            status_code=413,
+            detail=f"File too large. Maximum size is {MAX_FILE_SIZE / (1024*1024)}MB"
+        )
+    
+    # Validate file extension
+    file_ext = Path(file.filename).suffix.lower()
+    if file_ext not in ALLOWED_EXTENSIONS:
+        raise HTTPException(
+            status_code=400,
+            detail=f"File type {file_ext} not allowed. Allowed types: {ALLOWED_EXTENSIONS}"
+        )
+    
+    # Sanitize filename - use UUID to prevent path traversal
+    safe_filename = f"{uuid.uuid4()}{file_ext}"
+    file_path = folder / safe_filename
+    
+    # Validate file content type
+    detected_type = mimetypes.guess_type(file.filename)[0]
+    if not detected_type or not detected_type.startswith(('image/', 'application/pdf')):
+        raise HTTPException(status_code=400, detail="Invalid file content type")
+    
+    # Ensure folder exists and is within expected directory
+    folder.mkdir(parents=True, exist_ok=True)
+    
+    with open(file_path, "wb") as buffer:
+        buffer.write(content)
+    
+    return str(file_path)
+
+# @router.post(
+#     "/insertdisability",
+#     status_code=status.HTTP_201_CREATED,
+#     summary="Register a new disability member",
+#     description="Create a new disability registration record following the external API format"
+# )
+# async def insert_disability(
+#     # Personal Information - Khmer
+#     disability_getinfor: Annotated[str, Form()],
+#     disability_family_name: Annotated[str, Form()],
+#     disability_given_name: Annotated[str, Form()],
+#     disability_name: Annotated[str, Form()],
+    
+#     # Personal Information - English
+#     disability_family_name_en: Annotated[str, Form()],
+#     disability_given_name_en: Annotated[str, Form()],
+#     disability_name_eng: Annotated[str, Form()],
+    
+#     # Basic Information
+#     gender: Annotated[int, Form()],
+#     national_id: Annotated[str, Form()],
+#     family_code: Annotated[str, Form()],
+#     phone_number: Annotated[str, Form()],
+#     date_of_birth: Annotated[str, Form()],
+    
+#     # ID Poor Information
+#     idpoor_id: Annotated[str, Form()],
+#     family_code_idpoor: Annotated[str, Form()],
+#     idpoor_status: Annotated[str, Form()],
+    
+#     # Vaccination Information
+#     vacine_status: Annotated[int, Form()],
+#     vacine_date: Annotated[str, Form()],
+    
+#     # Location and Living Situation
+#     village_id: Annotated[str, Form()],
+#     job: Annotated[str, Form()],
+#     live_with_who: Annotated[str, Form()],
+    
+#     # Disability Information
+#     reason_disability: Annotated[str, Form()],
+#     year_start_disability: Annotated[int, Form()],
+#     submit_date: Annotated[str, Form()],
+#     disability_code: Annotated[str, Form()],
+    
+#     # Scoring Information
+#     score_question: Annotated[str, Form()],
+    
+#     # Photo/Document Information
+#     disability_photo: Annotated[UploadFile, Form()],
+#     disability_photo_infor: Annotated[UploadFile, Form()],
+#     disability_photo_path: Annotated[UploadFile, Form()],
+#     disability_photo_doc: Annotated[UploadFile, Form()],
+    
+#     # Education Information
+#     child_education_level: Annotated[str, Form()],
+#     is_educated: Annotated[str, Form()],
+#     education_level: Annotated[str, Form()],
+    
+#     # Employment Information
+#     have_income: Annotated[str, Form()],
+#     primary_job: Annotated[str, Form()],
+#     find_job: Annotated[str, Form()],
+#     no_job_reason: Annotated[str, Form()],
+#     no_job_reason_other: Annotated[str, Form()],
+    
+#     # Training Information
+#     no_tvet: Annotated[str, Form()],
+#     is_tvet: Annotated[str, Form()],
+    
+#     # Support Information
+#     daily_help: Annotated[str, Form()],
+#     chronic_diseases: Annotated[str, Form()],
+    
+#     # Authentication
+#     keycloak_user: Annotated[UserInSignInKeyCloak, Depends(get_user_info)],
+#     db: Annotated[AsyncSession, Depends(async_get_db)],
+    
+#     # Optional parameters with defaults
+#     score_status_live: Annotated[str, Form()] = "",
+# ) -> dict:
+    
+#     # Save uploaded files and get paths
+#     disability_photo_path = await save_upload_file(disability_photo, UPLOAD_DIR)
+#     disability_photo_infor_path = await save_upload_file(disability_photo_infor, UPLOAD_DIR)
+#     disability_photo_doc_path = await save_upload_file(disability_photo_doc, UPLOAD_DIR)
+        
+#     logger.debug("MainCreateInternal fields: %s", MainCreateInternal.model_fields.keys())
+#     # Validate local DB user
+#     db_user = await validate_user(keycloak_user.username, keycloak_user, db)
+#     user_id = db_user["id"]
+
+#     # Get user_id_pwd from UserProfile table (DMIS info)
+#     user_profile = await crud_user_profile.get_by_user_id(db, user_id)
+#     if not user_profile:
+#         raise HTTPException(
+#             status_code=404, 
+#             detail="User profile with DMIS info not found. Please fetch /user-profile first."
+#         )
+#     user_profile_id = user_profile.id  # <-- This is the user_profile table's PK
+#     user_id_pwd = user_profile.user_id_pwd  # DMIS ID if needed
+
+#     logger.debug("UserProfile ID: %s", user_profile_id)
+#     logger.debug("UserProfile DMIS ID: %s", user_id_pwd)
+
+#     # --- DUPLICATE VALIDATION ---
+#     existing_record = await crud_main.get_by_created_by(db, user_id)
+#     if existing_record:
+#         raise HTTPException(
+#             status_code=status.HTTP_409_CONFLICT,
+#             detail=f"A disability registration already exists for user_id {user_id_pwd}."
+#         )
+    
+#     try:
+#         # Map gender integer to Gender enum
+#         gender_mapping = {0: Gender.OTHER, 1: Gender.MALE, 2: Gender.FEMALE}
+#         gender_enum = gender_mapping.get(gender, Gender.MALE)
+
+        
+#         # Convert year_start_disability to a date (assuming January 1st of that year)
+#         disability_date_val = date(year_start_disability, 1, 1) if year_start_disability else None
+#         submit_date_val = datetime.strptime(submit_date, "%Y-%m-%d").date() if submit_date else None
+
+
+#         # Create the registration data object
+#         registration_data = MainCreateInternal(
+#             # Map disability form fields to Main model fields
+#             # family_name=disability_family_name,
+#             # given_name=disability_given_name,
+#             # family_name_en=disability_family_name_en,
+#             # given_name_en=disability_given_name_en,
+#             gender=gender_enum,
+#             national_id=national_id,
+#             family_code=family_code,
+
+#             name=disability_name_eng,
+#             first_name=disability_given_name_en,
+#             last_name=disability_family_name_en,
+#             first_name_kh=disability_given_name,
+#             last_name_kh=disability_family_name,
+#             disability_date=disability_date_val,
+
+#             family_name=disability_family_name,
+#             given_name=disability_given_name,
+#             family_name_en=disability_family_name_en,
+#             given_name_en=disability_given_name_en,
+
+
+#             phone_number=phone_number,
+#             idpoor_id=idpoor_id,
+#             family_code_idpoor=family_code_idpoor,
+#             vacine_status=str(vacine_status),
+#             vacine_date=vacine_date,
+#             job=job,
+#             village_id=village_id,
+#             dob=date_of_birth,
+#             live_with_who=live_with_who,
+#             reason_disability=reason_disability,
+#             year_start_disability=str(year_start_disability),
+#             score_question=score_question,
+#             score_status_live=score_status_live,
+#             is_educated=is_educated,
+#             education_level=education_level,
+#             have_income=have_income,
+#             primary_job=primary_job,
+#             find_job=find_job,
+#             no_job_reason=no_job_reason,
+#             no_job_reason_other=no_job_reason_other,
+#             no_tvet_reason=no_tvet, 
+#             is_tvet=is_tvet,
+#             daily_help=daily_help,
+#             chronic_diseases=chronic_diseases,
+#             idpoor_status=idpoor_status,
+#             disability_getinfor=disability_getinfor,
+#             disability_name=disability_name,
+#             submit_date=submit_date_val,
+#             child_education_level=child_education_level,
+
+#             disability_code=disability_code,
+            
+#             # Set required fields that don't directly map
+#             gazetteer_code=village_id,  # Use village_id as gazetteer_code
+
+#             # Save uploaded file paths
+#             disability_photo=disability_photo_path,
+#             disability_photo_infor=disability_photo_infor_path,
+#             disability_photo_path=disability_photo_path,
+#             disability_photo_doc=disability_photo_doc_path,
+
+
+#             # Additional notes with unmapped fields
+#             notes=f"Disability Registration - Name: {disability_name}, Name EN: {disability_name_eng}, GetInfo: {disability_getinfor}, Submit Date: {submit_date}, Photo: {disability_photo}, Photo Info: {disability_photo_infor}, Photo Path: {disability_photo_path}, Photo Doc: {disability_photo_doc}, Child Education: {child_education_level}",
+            
+
+#             # created_by=int(user_profile.user_id),
+#             created_by=user_id,
+#         )
+        
+#         # Create the main record in database
+#         created_record = await crud_main.create(db=db, object=registration_data)
+
+#         # Serialize the full DB record
+#         record_data = MainRead.from_orm(created_record)
+
+
+#         # Step loop score_question
+#         # convert score_question to object
+
+#         score_question_array = [
+#             {"keyname": "Q1_1_1", "answer_code": "A1", "category": "C1"},
+#             {"keyname": "Q1_1_2", "answer_code": "A1", "category": "C1"},
+#             {"keyname": "Q1_1_3", "answer_code": "A1", "category": "C1"},
+#             {"keyname": "Q1_1_4", "answer_code": "A1", "category": "C1"},
+#             {"keyname": "Q1_1_5", "answer_code": "A2", "category": "C1"},
+#             {"keyname": "Q1_1_6", "answer_code": "Ä2", "category": "C1"},
+#             {"keyname": "Q1_1_7", "answer_code": "A2", "category": "C1"},
+#         ]
+
+
+#         # Decide: use frontend data or fallback to static
+#         if score_question and score_question.strip():
+#             try:
+#                 questions = json.loads(score_question)
+#                 if not isinstance(questions, list):
+#                     raise ValueError("score_question must be a JSON array")
+#                 raw_json_to_save = score_question.strip()
+#                 logging.debug("Using score_question from frontend")
+#             except json.JSONDecodeError as e:
+#                 raise HTTPException(status_code=400, detail=f"Invalid JSON in score_question: {e}")
+#         else:
+#             questions = score_question_array
+#             raw_json_to_save = json.dumps(score_question_array)  # Convert static list → JSON string
+#             logging.debug("No score_question provided → using static default answers")
+
+#         # Save the raw JSON string into main.score_question field
+#         created_record.score_question = raw_json_to_save
+#         await db.commit()
+#         await db.refresh(created_record)
+
+#         saved_count = 0
+#         for q in questions:
+#             keyname = q["keyname"]
+#             answer_code = q["answer_code"]
+#             category_code = q.get("category") or q.get("category_code")
+
+#             question_answer_data = QuestionAnswerCreateInternal(
+#                 main_id=created_record.id,
+#                 question_code=keyname,
+#                 category_code=category_code,
+#                 answer_code=answer_code
+#             )
+
+#             await crud_question_answer.create_question_answer(db=db, qa_data=question_answer_data)
+#             saved_count += 1
+
+#         logging.debug(f"Inserted {saved_count} score answers into question_answer table")
+
+#         # questions = [{"keyname":"Q1_4_1","keyscore":1, "answer_code": "A1", "category_code": "C1"},{"keyname":"Q1_4_6","keyscore":3, "answer_code": "A2", "category_code": "C2"}]
+
+#         # for q in questions:
+#         #     keyname = q["keyname"]
+#         #     answer_code = q["answer_code"]
+#         #     category_code = q["category_code"]
+#         #     crud_question_answer_data = QuestionAnswerInternal(
+#         #         main_id=created_record.id,
+#         #         question_code=keyname,
+#         #         category_code=category_code,
+#         #         answer_code=answer_code
+#         #     )
+
+#         #     question_answer_created_record = await crud_question_answer.create(db=db, object=crud_question_answer_data)
+
+        
+        
+#         # return {
+#         #     "message": f"Disability registration created successfully for {disability_name_eng}",
+#         #     "disability_id": created_record.id,
+#         #     "status": "registered",
+#         #     "record_id": created_record.id,
+#         #     "user_id": user_id_pwd,
+#         #     "created_by": str(user_id_pwd)
+#         # }
+
+#         return {
+#             "error": False,
+#             "message": "success",
+#             "data": record_data.model_dump(by_alias=True)  # <- important
+#         }
+        
+#     except ValueError as e:
+#         raise HTTPException(
+#             status_code=status.HTTP_400_BAD_REQUEST,
+#             detail=str(e)
+#         )
+#     except IntegrityError as e:
+#         raise HTTPException(
+#             status_code=status.HTTP_409_CONFLICT,
+#             detail=f"Database integrity error - possibly duplicate national ID: {str(e)}"
+#         )
+#     except Exception as e:
+#         raise HTTPException(
+#             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+#             detail=f"Failed to create disability registration: {str(e)}"
+#         )
+
+
+from ...models.main_asset import MainAsset, AssetType
+from ...core.services.minio_service import MinioService
+from ...models.main import (
+    Main as MainModel,
+)
+
+@router.post(
+    "/insertdisability",
+    status_code=status.HTTP_201_CREATED,
+    summary="Register a new disability member",
+    description="Create a new disability registration record following the external API format"
+)
+async def insert_disability(
+    # Authentication
+    keycloak_user: Annotated[UserInSignInKeyCloak, Depends(get_user_info)],
+    db: Annotated[AsyncSession, Depends(async_get_db)],
+    
+    # Personal Information - Khmer
+    disability_getinfor: Annotated[str, Form()],
+    disability_family_name: Annotated[str, Form()],
+    disability_given_name: Annotated[str, Form()],
+    disability_name: Annotated[str, Form()],
+    
+    # Personal Information - English
+    disability_family_name_en: Annotated[str, Form()],
+    disability_given_name_en: Annotated[str, Form()],
+    disability_name_eng: Annotated[str, Form()],
+    
+    # Basic Information
+    gender: Annotated[int, Form()],
+    national_id: Annotated[str, Form()],
+    family_code: Annotated[str, Form()],
+    phone_number: Annotated[str, Form()],
+    date_of_birth: Annotated[str, Form()],
+    
+    # ID Poor Information
+    idpoor_id: Annotated[str, Form()],
+    family_code_idpoor: Annotated[str, Form()],
+    idpoor_status: Annotated[str, Form()],
+    
+    # Vaccination Information
+    vacine_status: Annotated[int, Form()],
+    vacine_date: Annotated[str, Form()],
+    
+    # Location and Living Situation
+    village_id: Annotated[str, Form()],
+    job: Annotated[str, Form()],
+    live_with_who: Annotated[str, Form()],
+    
+    # Disability Information
+    reason_disability: Annotated[str, Form()],
+    year_start_disability: Annotated[int, Form()],
+    submit_date: Annotated[str, Form()],
+
+    # disability code
+    disability_code: Annotated[str, Form()],
+    
+    # Scoring Information
+    score_question: Annotated[str, Form()],
+
+    # Education Information
+    child_education_level: Annotated[str, Form()],
+    is_educated: Annotated[str, Form()],
+    education_level: Annotated[str, Form()],
+    
+    # Employment Information
+    have_income: Annotated[str, Form()],
+    primary_job: Annotated[str, Form()],
+    find_job: Annotated[str, Form()],
+    no_job_reason: Annotated[str, Form()],
+    no_job_reason_other: Annotated[str, Form()],
+    
+    # Training Information
+    no_tvet: Annotated[str, Form()],
+    is_tvet: Annotated[str, Form()],
+    
+    # Support Information
+    daily_help: Annotated[str, Form()],
+    chronic_diseases: Annotated[str, Form()],
+
+    # Asset Information
+    disability_photo: Annotated[UploadFile, Form()],
+    disability_photo_full: Annotated[UploadFile, Form()],
+
+    fp_right_photos: Annotated[list[UploadFile], Form()] = [],
+    fp_left_photos: Annotated[list[UploadFile], Form()] = [],
+    fp_right_metadatas: Annotated[list[str], Form()] = [],
+    fp_left_metadatas: Annotated[list[str], Form()] = [],
+
+    # Optional Related Documents (all optional)
+    family_book: Annotated[UploadFile | None, Form()] = None,  # សៀវភៅគ្រួសារ
+    residence_book: Annotated[UploadFile | None, Form()] = None,  # សៀវភៅស្នាក់នៅ
+    national_id_card: Annotated[UploadFile | None, Form()] = None,  # អត្តសញ្ញាណបណ្ណ
+    equity_card: Annotated[UploadFile | None, Form()] = None,  # បណ្ណសមធ័ម៌
+
+    # Optional parameters with defaults
+    score_status_live: Annotated[str, Form()] = "",
+
+) -> dict:
+        
+    # Validate local DB user
+    db_user = await validate_user(keycloak_user.username, keycloak_user, db)
+    user_id = db_user["id"]
+
+    # Get user_id_pwd from UserProfile table (DMIS info)
+    user_profile = await crud_user_profile.get_by_user_id(db, user_id)
+    if not user_profile:
+        raise HTTPException(
+            status_code=404, 
+            detail="User profile with DMIS info not found. Please fetch /user-profile first."
+        )
+    user_profile_id = user_profile.id 
+    user_id_pwd = user_profile.user_id_pwd  # DMIS ID if needed
+
+    logger.debug("UserProfile ID: %s", user_profile_id)
+    logger.debug("UserProfile DMIS ID: %s", user_id_pwd)
+
+
+    # --- DUPLICATE VALIDATION ---
+    existing_record = await crud_main.get_by_disability_name(db, disability_name)
+    if existing_record:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=f"ជនមានពិការភាពជាមួយឈ្មោះ{disability_name} នេះបានចុះឈ្មោះរួចហើយ"
+        )
+    
+    try:
+        # Map gender integer to Gender enum
+        gender_mapping = {0: Gender.OTHER, 1: Gender.MALE, 2: Gender.FEMALE}
+        gender_enum = gender_mapping.get(gender, Gender.MALE)
+        
+        # Convert year_start_disability to a date (assuming January 1st of that year)
+        disability_date_val = date(year_start_disability, 1, 1) if year_start_disability else None
+        submit_date_val = datetime.strptime(submit_date, "%Y-%m-%d").date() if submit_date else None
+
+        # Create the registration data object
+        registration_data = MainModel(
+            gender=gender_enum,
+            national_id=national_id,
+            family_code=family_code,
+            name=disability_name_eng,
+            first_name=disability_given_name_en,
+            last_name=disability_family_name_en,
+            first_name_kh=disability_given_name,
+            last_name_kh=disability_family_name,
+            disability_date=disability_date_val,
+            family_name=disability_family_name,
+            given_name=disability_given_name,
+            family_name_en=disability_family_name_en,
+            given_name_en=disability_given_name_en,
+            phone_number=phone_number,
+            idpoor_id=idpoor_id,
+            family_code_idpoor=family_code_idpoor,
+            vacine_status=str(vacine_status),
+            vacine_date=vacine_date,
+            job=job,
+            village_id=village_id,
+            dob=date_of_birth,
+            live_with_who=live_with_who,
+            reason_disability=reason_disability,
+            year_start_disability=str(year_start_disability),
+            score_question=score_question,
+            score_status_live=score_status_live,
+            is_educated=is_educated,
+            education_level=education_level,
+            have_income=have_income,
+            primary_job=primary_job,
+            find_job=find_job,
+            no_job_reason=no_job_reason,
+            no_job_reason_other=no_job_reason_other,
+            no_tvet_reason=no_tvet, 
+            is_tvet=is_tvet,
+            daily_help=daily_help,
+            chronic_diseases=chronic_diseases,
+            idpoor_status=idpoor_status,
+            disability_getinfor=disability_getinfor,
+            disability_name=disability_name,
+            submit_date=submit_date_val,
+            child_education_level=child_education_level,
+            gazetteer_code=village_id,
+            created_by=user_id,
+        )
+
+        db.add(registration_data)
+        await db.flush()
+        
+        main_id = registration_data.id
+        logging.info(f"Created main record with ID: {main_id}")
+
+        single_photos = {
+            "disability_photo": (
+                disability_photo,
+                AssetType.DISABILITY_PHOTO,
+            ),
+            "disability_photo_full": (
+                disability_photo_full, 
+                AssetType.DISABILITY_PHOTO_FULL,
+            ),
+        }
+
+        for field_name, (file, asset_type) in single_photos.items():
+            if file:
+                try:
+                    # Read file content
+                    content = await file.read()
+
+                    # Generate path with UUID
+                    unique_id = str(uuid.uuid4())
+                    file_path = f"{main_id}/main/{field_name}_{unique_id}.png"
+
+                    # Upload to MinIO
+                    if settings.ENVIRONMENT == "local" and content:
+                        await MinioService.upload_file(
+                            file_content=content,
+                            file_name=file_path,
+                            content_type=file.content_type or "image/png",
+                        )
+
+                    # Create asset record using Pydantic model
+                    asset_data = MainAsset(
+                        main_id=main_id,
+                        attachment=file_path,
+                        type=asset_type,
+                    )
+
+                    db.add(asset_data)
+                    await db.flush()
+
+                except Exception as e:
+                    # Rollback the transaction if MinIO upload fails
+                    await db.rollback()
+                    raise e
+
+        # Handle optional related documents
+        if family_book or residence_book or national_id_card or equity_card:
+            related_docs = {
+                "family_book": (family_book, AssetType.FAMILY_BOOK),
+                "residence_book": (residence_book, AssetType.RESIDENCE_BOOK),
+                "national_id_card": (national_id_card, AssetType.NID),
+                "equity_card": (equity_card, AssetType.EQUITY_CARD),
+            }
+
+            for field_name, (file, asset_type) in related_docs.items():
+                if file:   
+                    try:
+                        # Read file content
+                        content = await file.read()
+
+                        # Generate path with UUID
+                        unique_id = str(uuid.uuid4())
+                        file_path = f"{main_id}/main/{field_name}_{unique_id}.png"
+
+                        # Upload to MinIO
+                        if settings.ENVIRONMENT == "local" and content:
+                            await MinioService.upload_file(
+                                file_content=content,
+                                file_name=file_path,
+                                content_type=file.content_type or "image/png",
+                            )
+
+                        # Create asset record using Pydantic model
+                        asset_data = MainAsset(
+                            main_id=main_id,
+                            attachment=file_path,
+                            type=asset_type,
+                        )
+
+                        db.add(asset_data)
+                        await db.flush()
+
+                    except Exception as e:
+                        # Rollback the transaction if MinIO upload fails
+                        await db.rollback()
+                        raise e
+
+        
+        # Handle multiple fingerprint photos
+        fingerprint_photos = {
+            "fp_right_photos": (fp_right_photos, AssetType.FP_RIGHT, fp_right_metadatas),
+            "fp_left_photos": (fp_left_photos, AssetType.FP_LEFT, fp_left_metadatas),
+        }
+        for field_name, (files, asset_type, metadata_list) in fingerprint_photos.items():
+            if files:
+                # Handle each file in the list
+                for index, file in enumerate(files):
+                    try:
+                        # Read file content
+                        content = await file.read()
+
+                        # Generate path with UUID
+                        unique_id = str(uuid.uuid4())
+                        file_path = f"{main_id}/main/{field_name}_{unique_id}.png"
+
+
+                        if settings.ENVIRONMENT == "local" and content:
+                            # Upload to MinIO
+                            await MinioService.upload_file(
+                                file_content=content,
+                                file_name=file_path,
+                                content_type=file.content_type or "image/png",
+                            )
+
+                        # Get metadata for this specific file
+                        file_metadata = None
+                        if metadata_list and index < len(metadata_list):
+                            metadata_string = metadata_list[index]
+                            # Validate that the metadata is valid JSON
+                            try:
+                                # Parse to validate JSON format
+                                json.loads(metadata_string)
+                                file_metadata = metadata_string
+                            except json.JSONDecodeError as e:
+                                logging.warning(
+                                    f"Invalid JSON metadata for {asset_type.name.lower()} "
+                                    f"photo {index}: {e}"
+                                )
+                                # Store as plain text if not valid JSON
+                                file_metadata = metadata_string
+
+                        new_asset = MainAsset(
+                            main_id=main_id,
+                            attachment=file_path,
+                            type=asset_type,
+                            remarks=file_metadata,
+                        )
+                        db.add(new_asset)
+                        await db.flush()
+
+                    except Exception as e:
+                        # Rollback the transaction if MinIO upload fails
+                        await db.rollback()
+                        raise e
+
+        # Commit the transaction if everything succeeded
+        await db.commit()
+        await db.refresh(registration_data)
+        
+        # Convert SQLAlchemy model to Pydantic schema before serializing
+        main_read_schema = MainRead.model_validate(registration_data)
+        
+        return {
+            "error": False,
+            "message": "success",
+            "data": main_read_schema.model_dump(by_alias=True)
+        }
+        
+    except Exception as e:
+        # Rollback on any error
+        await db.rollback()
+        
+        # Log the error for debugging
+        error_message = str(e)
+        logging.error(f"Error in create_member: {error_message}", exc_info=True)
+
+        # Check if it's an HTTPException and re-raise it
+        if isinstance(e, HTTPException):
+            raise
+        
+        # Check if it's a validation error and handle it gracefully
+        if "validation error" in error_message.lower() and "FmAccountMain" in error_message:
+            # This is a Pydantic validation error, provide user-friendly message
+            if "String should have at least" in error_message:
+                # Generic string length error
+                raise HTTPException(
+                    status_code=HTTPStatus.BAD_REQUEST, detail="សូមពិនិត្យបំពេញទិន្នន័យរបស់អ្នកឡើងវិញ ហើយព្យាយាមម្តងទៀត។"
+                )
+            else:
+                # Generic validation error
+                raise HTTPException(
+                    status_code=HTTPStatus.BAD_REQUEST, detail="សូមពិនិត្យបំពេញទិន្នន័យរបស់អ្នកឡើងវិញ ហើយព្យាយាមម្តងទៀត។"
+                )
+        else:
+            # Other types of errors
+            raise HTTPException(
+                status_code=HTTPStatus.INTERNAL_SERVER_ERROR,
+                detail=(
+                    "មានបញ្ហាបច្ចេកទេស សូមទាក់ទងជំនួយ។"
+                    if settings.ENVIRONMENT == "production"
+                    else f"Error creating main account: {error_message}"
+                ),
+            )
