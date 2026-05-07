@@ -350,3 +350,18 @@ async def update_main_status(
             detail=str(e),
         )
 
+=================
+
+# =================================================
+        # STEP 4: CALL SPR API HERE
+        # =================================================
+        # Example:
+        #
+        # spr_response = await spr_service.update_status(...)
+        #
+        # if not spr_response["success"]:
+        #     raise Exception("SPR update failed")
+
+        # =================================================
+        # STEP 5: SUCCESS RESPONSE
+        # =================================================
