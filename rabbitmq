@@ -1,0 +1,114 @@
+About rabbitmq 
+
+what are the different rabbitma_consumer and rabbit_handler?
+
+========================================================================================================\n
+
+          - RabbitMQ = Post Office
+          
+          - Consumer = Mail Receiver
+          
+          - Handler = Person who reads the mail and does work
+
+========================================================================================================\n
+
+1. rabbitmq_consumer.py
+
+This file is responsible for:
+      
+      - ONLY listening to RabbitMQ queues
+      
+      - It does NOT contain business logic.
+
+Its job is:
+
+        - connect to RabbitMQ
+        - listen queue
+        - receive message
+        - send message to handler
+
+Example
+
+SPR publishes:
+
+{
+  "status": "PWD_APPROVED",
+  "spid": "1000004230",
+  "disability_card": "DIS0001"
+}
+
+The consumer receives it.
+
+Like:
+
+message = await queue.receive()
+
+Then consumer says:
+
+"Okay I received message,
+now handler please process it."
+
+So consumer calls:
+
+await handle_pwd_status_updates(data)
+What consumer does
+Responsibilities
+1. Connect RabbitMQ
+await aio_pika.connect_robust(...)
+2. Declare queues
+await channel.declare_queue(...)
+3. Listen messages
+await queue.consume(...)
+4. Receive JSON message
+data = json.loads(message.body.decode())
+5. Call handlers
+await callback(data)
+Important
+
+Consumer SHOULD NOT:
+
+update database
+update member status
+send notification
+business logic
+
+That belongs to handlers.
+
+================================================
+2. rabbitmq_handlers.py
+================================================
+
+This file contains:
+
+BUSINESS LOGIC
+
+When consumer receives message,
+handler decides what to do.
+
+Example
+
+Consumer says:
+
+"I received PWD_APPROVED message"
+
+Handler says:
+
+"Okay,
+I will update DB,
+create logs,
+notify user."
+What handler does
+Responsibilities
+1. Read queue message
+status = message.get("status")
+2. Validate data
+if status not in allowed_statuses:
+3. Query database
+select(Main)
+4. Update member
+member.status = status
+5. Create logs
+await crud_dmis_logs.create_log(...)
+6. Notify user later
+send sms
+send notification
